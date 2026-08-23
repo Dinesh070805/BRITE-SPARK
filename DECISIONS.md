@@ -1,0 +1,93 @@
+# Full-Stack Architectural & Design Decisions
+
+This document details the full-stack technical decisions, database design, dataset findings, and regulatory compliance retro-fits for the **Reminder That Reaches** application.
+
+---
+
+## 1. Direction CR-2026/11 Regulatory Retro-Fit (Rolling 7-Day Contact Limit)
+
+### What Changed
+Regulator Direction **CR-2026/11** introduced an immediately in-force mandatory rule: **A resident must NOT receive more than 2 contacts within ANY rolling 7-day period across ALL channels.**
+
+### Why Existing Implementation Had to Change
+The original system evaluated contact policy per appointment and per channel. To comply with Direction CR-2026/11, a pre-check evaluation layer was retro-fitted into `ContactPolicyService` to calculate cumulative outbound contacts across all channels for each resident over a true rolling 7-day window.
+
+### How the Rolling 7-Day Limit Was Implemented
+- `ContactPolicyService.count_regulatory_contacts()` queries the database for all outbound attempt records (`ReminderAttemptDB`) for a given `resident_id` within `[at_time - timedelta(days=7), at_time]`.
+- `ContactPolicyService.evaluate_regulatory_limit()` evaluates if `count < 2`. If `count >= 2`, contact is withheld (`permitted=False, withheld=True`).
+
+### How Historical Contacts Are Handled
+The rule is applied retrospectively. All historical attempt records stored in `reminder_attempts` that fall within the rolling 7-day window contribute to the resident's current contact count. Counters are not initialized to zero.
+
+### What Counts as a Contact
+**ATTEMPT = CONTACT.** Every outbound attempt directed at a resident (SMS, Voice, Email) counts as 1 regulatory contact, regardless of outcome (succeeded, failed, unanswered, voicemail, busy, carrier rejected, soft/hard bounce). Blocked attempts (where no outbound transmission occurred because limit was reached) do NOT count as outbound contacts.
+
+### How Blocked Appointments Are Recorded
+When contact is withheld:
+1. No outbound call/SMS/email is dispatched.
+2. An evidence record is created containing: `resident_id`, `appointment_id`, `evaluation_timestamp`, `rolling_window_start`, `rolling_window_end`, `prior_contacts_count`, `max_allowed_contacts` (2), `permitted` (False), `withheld` (True), `reason`, and `prioritisation_basis`.
+3. An audit log (`AuditLogDB`) is generated with `action="REGULATORY_CHECK"` and `status="WITHHELD"`.
+
+### How Prioritisation Is Handled
+Appointments are processed strictly chronologically based on `scheduled_at` timestamp. **Zero protected characteristics** (race, religion, gender, disability, age, nationality, ethnicity) are used for prioritisation.
+
+### What Was Deliberately NOT Changed
+Existing channel eligibility checks (quiet hours, channel opt-outs, landline safety checks) and the distinct definitions of `DELIVERED` vs. `REACHED` were preserved. The regulatory check operates as an overriding pre-dispatch rule.
+
+### What Would Have Been Done Differently If Known Before Part 1
+If this requirement was known prior to Part 1, a dedicated `regulatory_decisions` table and pre-dispatch hook pipeline would have been designed into the initial database schema rather than integrating the check into `ContactPolicyService`.
+
+---
+
+## 2. Quiet Hours Enforcement
+- **Database Storage**: Stored in SQLite (`policies` table) as `quiet_hours_start` (default 20) and `quiet_hours_end` (default 8).
+- **Backend Policy**: Enforced by `ContactPolicyService`. Reminders attempted between 20:00 and 08:00 are marked `status="Deferred"` and scheduled for 08:00 AM the next day. Editable live via `PUT /api/policies`.
+
+---
+
+## 3. Opt-Out Enforcement
+- **Storage**: Fields `sms_optout`, `voice_optout`, `email_optout` in `residents` SQLite table.
+- **Enforcement**: Centralized in `ContactPolicyService.evaluate_channel()`. If all three channels are opted out, `ReminderEngineService` marks reminder as `status="Blocked"` and records an audit log with `action="BLOCKED"`.
+
+---
+
+## 4. Multilingual Support & Fallback
+- **Supported Languages**: `en`, `es`, `vi`, `so`, `ru`, `zh`.
+- **Fallback Rule**: Unsupported or missing language codes default to `"en"`. The `LanguageService` increments `fallback_count` and records fallback details.
+
+---
+
+## 5. Shared Contact Deduplication
+- **Deduplication Key**: `(normalized_contact_point, channel, appointment_id)`.
+- **Normalization**: Phone numbers stripped to digits-only (e.g. `555-853-5210` → `5558535210`), emails converted to lowercased trimmed strings.
+- **Behavior**: Prevents duplicate reminders sent to the same contact point for the same appointment booking.
+
+---
+
+## 6. Landline Handling
+- **Observation**: 41 mobile fields in `contacts.csv` contain numbers in the `555-2xx` landline carrier block.
+- **Safety Decision**: `ContactPolicyService.is_landline_number()` identifies `555-2xx` numbers and marks SMS as ineligible, preventing unroutable SMS attempts. Landlines remain eligible for Voice calls.
+
+---
+
+## 7. Delivered vs. Reached Definition
+- **Delivered**: Carrier / server acknowledged receipt (`SMS: delivered`, `Voice: voicemail_left`, `Email: delivered`).
+- **Reached**: **Confirmed human interaction**. Only `Voice` status `answered` with detail `human` qualifies as `reached = True`.
+
+---
+
+## 8. Bounded Fallback & Stopping Rules
+- Hierarchy: `SMS -> Voice -> Email`.
+- Sequence terminates when:
+  1. Voice call answered by human (`reached == True`).
+  2. Max attempt limit reached (configurable in `policies` table, default: 3).
+  3. Lead time threshold (< 30 minutes to appointment).
+  4. Regulatory limit reached (max 2 contacts per rolling 7 days).
+  5. No eligible channels remain.
+
+---
+
+## 9. Database Architecture
+- Using SQLite (`reminder.db`) via SQLAlchemy 2.0 ORM.
+- Tables: `residents`, `appointments`, `reminders`, `reminder_attempts`, `audit_logs`, `policies`.
+- Seeded via `python backend/seed_database.py`.
